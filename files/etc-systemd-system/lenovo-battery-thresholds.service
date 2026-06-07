@@ -1,0 +1,10 @@
+[Unit]
+Description=Set Lenovo battery charge thresholds
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/thinkpad-battery-threshold-helper conserve
+
+[Install]
+WantedBy=multi-user.target

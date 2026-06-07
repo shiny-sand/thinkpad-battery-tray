@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Temporary full-charge mode.
+# Set stop first, because start must not be higher than stop.
+echo 100 | sudo tee /sys/class/power_supply/BAT0/charge_control_end_threshold >/dev/null
+echo 95 | sudo tee /sys/class/power_supply/BAT0/charge_control_start_threshold >/dev/null
+
+echo "Temporary full-charge mode enabled: start 95%, stop 100%."
+echo "This will automatically return to conservation mode after next boot."
+echo "To switch back now, run: battery-conserve"
+echo
+echo "Current thresholds:"
+echo -n "Start: "
+cat /sys/class/power_supply/BAT0/charge_control_start_threshold
+echo -n "Stop:  "
+cat /sys/class/power_supply/BAT0/charge_control_end_threshold
+echo -n "Status: "
+cat /sys/class/power_supply/BAT0/status
+echo -n "Capacity: "
+cat /sys/class/power_supply/BAT0/capacity

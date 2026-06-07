@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=ThinkPad Battery Tray
+Comment=Lenovo battery threshold tray control
+Exec=/usr/local/bin/thinkpad-battery-tray
+Icon=/usr/local/share/thinkpad-battery-tray/icon.svg
+Terminal=false
+Categories=Utility;Settings;
+StartupNotify=false

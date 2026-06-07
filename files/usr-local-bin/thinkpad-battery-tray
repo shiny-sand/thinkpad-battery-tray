@@ -1,0 +1,439 @@
+#!/usr/bin/env python3
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QAction, QIcon
+from PySide6.QtWidgets import (
+    QApplication,
+    QFrame,
+    QGridLayout,
+    QHBoxLayout,
+    QLabel,
+    QMainWindow,
+    QMenu,
+    QMessageBox,
+    QPushButton,
+    QProgressBar,
+    QSpinBox,
+    QSystemTrayIcon,
+    QVBoxLayout,
+    QWidget,
+)
+
+APP_DIR = Path("/usr/local/share/thinkpad-battery-tray")
+ICON_PATH = APP_DIR / "icon.svg"
+HELPER = "/usr/local/libexec/thinkpad-battery-threshold-helper"
+
+BAT_PATH = Path(os.environ.get("THINKPAD_BAT_PATH", "/sys/class/power_supply/BAT0"))
+START_FILE = BAT_PATH / "charge_control_start_threshold"
+STOP_FILE = BAT_PATH / "charge_control_end_threshold"
+CAPACITY_FILE = BAT_PATH / "capacity"
+STATUS_FILE = BAT_PATH / "status"
+MANUFACTURER_FILE = BAT_PATH / "manufacturer"
+MODEL_FILE = BAT_PATH / "model_name"
+
+CONSERVE = (70, 80)
+FULL = (95, 100)
+
+
+def read_text(path: Path, fallback: str = "Unknown") -> str:
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except Exception:
+        return fallback
+
+
+def read_int(path: Path, fallback: int = -1) -> int:
+    try:
+        return int(read_text(path, str(fallback)))
+    except Exception:
+        return fallback
+
+
+def run_pkexec(args):
+    cmd = ["pkexec", HELPER] + args
+    return subprocess.run(cmd, text=True, capture_output=True, check=False)
+
+
+def mode_name(start: int, stop: int) -> str:
+    if (start, stop) == CONSERVE:
+        return "Conservation"
+    if (start, stop) == FULL:
+        return "Full charge"
+    return "Custom"
+
+
+class BatteryWindow(QMainWindow):
+    def __init__(self, tray):
+        super().__init__()
+        self.tray = tray
+        self.setWindowTitle("ThinkPad Battery")
+        self.setMinimumWidth(420)
+
+        root = QWidget()
+        self.setCentralWidget(root)
+
+        layout = QVBoxLayout(root)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(14)
+
+        title = QLabel("Lenovo Battery Control")
+        title.setObjectName("Title")
+        subtitle = QLabel("Charge thresholds for battery health")
+        subtitle.setObjectName("Subtitle")
+
+        layout.addWidget(title)
+        layout.addWidget(subtitle)
+
+        self.card = QFrame()
+        self.card.setObjectName("Card")
+        grid = QGridLayout(self.card)
+        grid.setContentsMargins(16, 16, 16, 16)
+        grid.setHorizontalSpacing(14)
+        grid.setVerticalSpacing(10)
+
+        self.mode_label = QLabel("Unknown")
+        self.mode_label.setObjectName("Mode")
+        self.capacity_bar = QProgressBar()
+        self.capacity_bar.setRange(0, 100)
+        self.capacity_bar.setTextVisible(True)
+
+        self.status_label = QLabel("Unknown")
+        self.start_label = QLabel("Unknown")
+        self.stop_label = QLabel("Unknown")
+        self.device_label = QLabel("Unknown")
+
+        grid.addWidget(QLabel("Mode"), 0, 0)
+        grid.addWidget(self.mode_label, 0, 1)
+
+        grid.addWidget(QLabel("Battery"), 1, 0)
+        grid.addWidget(self.capacity_bar, 1, 1)
+
+        grid.addWidget(QLabel("Status"), 2, 0)
+        grid.addWidget(self.status_label, 2, 1)
+
+        grid.addWidget(QLabel("Start"), 3, 0)
+        grid.addWidget(self.start_label, 3, 1)
+
+        grid.addWidget(QLabel("Stop"), 4, 0)
+        grid.addWidget(self.stop_label, 4, 1)
+
+        grid.addWidget(QLabel("Device"), 5, 0)
+        grid.addWidget(self.device_label, 5, 1)
+
+        layout.addWidget(self.card)
+
+        button_row = QHBoxLayout()
+        self.conserve_button = QPushButton("Conservation 70/80")
+        self.full_button = QPushButton("Full until reboot 95/100")
+        self.refresh_button = QPushButton("Refresh")
+
+        self.conserve_button.clicked.connect(lambda: self.apply_mode("conserve"))
+        self.full_button.clicked.connect(lambda: self.apply_mode("full"))
+        self.refresh_button.clicked.connect(self.refresh)
+
+        button_row.addWidget(self.conserve_button)
+        button_row.addWidget(self.full_button)
+        button_row.addWidget(self.refresh_button)
+
+        layout.addLayout(button_row)
+
+        custom_card = QFrame()
+        custom_card.setObjectName("Card")
+        custom_layout = QGridLayout(custom_card)
+        custom_layout.setContentsMargins(16, 16, 16, 16)
+        custom_layout.setHorizontalSpacing(14)
+        custom_layout.setVerticalSpacing(10)
+
+        self.custom_start = QSpinBox()
+        self.custom_start.setRange(0, 100)
+        self.custom_start.setValue(70)
+        self.custom_start.setSuffix("%")
+
+        self.custom_stop = QSpinBox()
+        self.custom_stop.setRange(0, 100)
+        self.custom_stop.setValue(80)
+        self.custom_stop.setSuffix("%")
+
+        self.custom_apply = QPushButton("Apply custom")
+        self.custom_apply.clicked.connect(self.apply_custom)
+
+        custom_layout.addWidget(QLabel("Custom start"), 0, 0)
+        custom_layout.addWidget(self.custom_start, 0, 1)
+        custom_layout.addWidget(QLabel("Custom stop"), 1, 0)
+        custom_layout.addWidget(self.custom_stop, 1, 1)
+        custom_layout.addWidget(self.custom_apply, 2, 0, 1, 2)
+
+        layout.addWidget(custom_card)
+
+        note = QLabel("Full charge mode is temporary. On next boot, the systemd service restores conservation mode.")
+        note.setWordWrap(True)
+        note.setObjectName("Note")
+        layout.addWidget(note)
+
+        self.setStyleSheet("""
+            QMainWindow {
+                background: #111827;
+            }
+            QLabel {
+                color: #e5e7eb;
+                font-size: 13px;
+            }
+            QLabel#Title {
+                font-size: 22px;
+                font-weight: 700;
+                color: #f9fafb;
+            }
+            QLabel#Subtitle {
+                color: #9ca3af;
+                font-size: 13px;
+            }
+            QLabel#Mode {
+                font-size: 18px;
+                font-weight: 700;
+                color: #86efac;
+            }
+            QLabel#Note {
+                color: #9ca3af;
+            }
+            QFrame#Card {
+                background: #1f2937;
+                border: 1px solid #374151;
+                border-radius: 14px;
+            }
+            QPushButton {
+                background: #2563eb;
+                color: white;
+                border: none;
+                border-radius: 10px;
+                padding: 9px 12px;
+                font-weight: 600;
+            }
+            QPushButton:hover {
+                background: #1d4ed8;
+            }
+            QSpinBox {
+                background: #111827;
+                color: #f9fafb;
+                border: 1px solid #374151;
+                border-radius: 8px;
+                padding: 6px;
+            }
+            QProgressBar {
+                background: #111827;
+                color: #f9fafb;
+                border: 1px solid #374151;
+                border-radius: 8px;
+                text-align: center;
+                min-height: 22px;
+            }
+            QProgressBar::chunk {
+                background: #22c55e;
+                border-radius: 8px;
+            }
+        """)
+
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.refresh)
+        self.timer.start(30_000)
+
+        self.refresh()
+
+    def get_state(self):
+        start = read_int(START_FILE)
+        stop = read_int(STOP_FILE)
+        capacity = read_int(CAPACITY_FILE)
+        status = read_text(STATUS_FILE)
+        manufacturer = read_text(MANUFACTURER_FILE, "")
+        model = read_text(MODEL_FILE, "")
+        return start, stop, capacity, status, manufacturer, model
+
+    def refresh(self):
+        start, stop, capacity, status, manufacturer, model = self.get_state()
+
+        if capacity >= 0:
+            self.capacity_bar.setValue(capacity)
+            self.capacity_bar.setFormat(f"{capacity}%")
+        else:
+            self.capacity_bar.setValue(0)
+            self.capacity_bar.setFormat("Unknown")
+
+        mode = mode_name(start, stop)
+        self.mode_label.setText(mode)
+        self.status_label.setText(status)
+        self.start_label.setText(f"{start}%")
+        self.stop_label.setText(f"{stop}%")
+        self.device_label.setText(" ".join(x for x in [manufacturer, model] if x).strip() or "BAT0")
+
+        self.custom_start.setValue(start if 0 <= start <= 100 else 70)
+        self.custom_stop.setValue(stop if 0 <= stop <= 100 else 80)
+
+        self.tray.update_tooltip(mode, start, stop, capacity, status)
+
+    def apply_mode(self, mode: str):
+        result = run_pkexec([mode])
+        if result.returncode != 0:
+            self.show_error("Could not change battery mode", result.stderr or result.stdout)
+            return
+        self.refresh()
+
+    def apply_custom(self):
+        start = self.custom_start.value()
+        stop = self.custom_stop.value()
+
+        if start > stop:
+            self.show_error("Invalid thresholds", "Start threshold must be lower than or equal to stop threshold.")
+            return
+
+        result = run_pkexec(["set", str(start), str(stop)])
+        if result.returncode != 0:
+            self.show_error("Could not apply custom thresholds", result.stderr or result.stdout)
+            return
+        self.refresh()
+
+    def show_error(self, title: str, message: str):
+        QMessageBox.critical(self, title, message.strip() or "Unknown error")
+
+
+class BatteryTray:
+    def __init__(self, app: QApplication):
+        self.app = app
+        self.window = None
+
+        icon = QIcon(str(ICON_PATH))
+        if icon.isNull():
+            icon = QIcon.fromTheme("battery-good-symbolic")
+
+        self.tray = QSystemTrayIcon(icon)
+        self.tray.setToolTip("ThinkPad Battery")
+
+        self.menu = QMenu()
+
+        self.summary_action = QAction("ThinkPad Battery")
+        self.summary_action.setEnabled(False)
+
+        self.mode_action = QAction("Mode: Unknown")
+        self.mode_action.setEnabled(False)
+
+        self.battery_action = QAction("Battery: Unknown")
+        self.battery_action.setEnabled(False)
+
+        self.threshold_action = QAction("Thresholds: Unknown")
+        self.threshold_action.setEnabled(False)
+
+        self.open_action = QAction("Open Battery Control")
+        self.open_action.triggered.connect(self.show_window)
+
+        self.conserve_action = QAction("Set Conservation 70/80")
+        self.conserve_action.triggered.connect(lambda: self.quick_mode("conserve"))
+
+        self.balanced_action = QAction("Set Balanced 80/90")
+        self.balanced_action.triggered.connect(lambda: self.quick_custom(80, 90))
+
+        self.full_action = QAction("Set Full until reboot 95/100")
+        self.full_action.triggered.connect(lambda: self.quick_mode("full"))
+
+        self.refresh_action = QAction("Refresh")
+        self.refresh_action.triggered.connect(self.refresh)
+
+        self.quit_action = QAction("Quit")
+        self.quit_action.triggered.connect(self.app.quit)
+
+        self.menu.addAction(self.summary_action)
+        self.menu.addAction(self.mode_action)
+        self.menu.addAction(self.battery_action)
+        self.menu.addAction(self.threshold_action)
+        self.menu.addSeparator()
+        self.menu.addAction(self.open_action)
+        self.menu.addSeparator()
+        self.menu.addAction(self.conserve_action)
+        self.menu.addAction(self.balanced_action)
+        self.menu.addAction(self.full_action)
+        self.menu.addSeparator()
+        self.menu.addAction(self.refresh_action)
+        self.menu.addAction(self.quit_action)
+
+        self.tray.setContextMenu(self.menu)
+        self.tray.activated.connect(self.on_activated)
+        self.tray.show()
+
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.refresh)
+        self.timer.start(30_000)
+
+        self.refresh()
+
+    def ensure_window(self):
+        if self.window is None:
+            self.window = BatteryWindow(self)
+        return self.window
+
+    def show_window(self):
+        window = self.ensure_window()
+        window.refresh()
+        window.show()
+        window.raise_()
+        window.activateWindow()
+
+    def on_activated(self, reason):
+        if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
+            self.show_window()
+
+    def quick_mode(self, mode: str):
+        result = run_pkexec([mode])
+        if result.returncode != 0:
+            QMessageBox.critical(None, "Could not change battery mode", (result.stderr or result.stdout).strip())
+        self.refresh()
+        if self.window:
+            self.window.refresh()
+
+    def quick_custom(self, start: int, stop: int):
+        result = run_pkexec(["set", str(start), str(stop)])
+        if result.returncode != 0:
+            QMessageBox.critical(None, "Could not change battery thresholds", (result.stderr or result.stdout).strip())
+        self.refresh()
+        if self.window:
+            self.window.refresh()
+
+    def refresh(self):
+        start = read_int(START_FILE)
+        stop = read_int(STOP_FILE)
+        capacity = read_int(CAPACITY_FILE)
+        status = read_text(STATUS_FILE)
+        mode = mode_name(start, stop)
+        self.update_tooltip(mode, start, stop, capacity, status)
+
+    def update_tooltip(self, mode: str, start: int, stop: int, capacity: int, status: str):
+        tooltip = (
+            f"ThinkPad Battery\n"
+            f"Mode: {mode}\n"
+            f"Battery: {capacity}% ({status})\n"
+            f"Thresholds: {start}/{stop}"
+        )
+        self.tray.setToolTip(tooltip)
+
+        if hasattr(self, "mode_action"):
+            self.mode_action.setText(f"Mode: {mode}")
+            self.battery_action.setText(f"Battery: {capacity}% ({status})")
+            self.threshold_action.setText(f"Thresholds: {start} / {stop}")
+
+
+def main():
+    app = QApplication(sys.argv)
+    app.setApplicationName("ThinkPad Battery Tray")
+    app.setQuitOnLastWindowClosed(False)
+
+    if not QSystemTrayIcon.isSystemTrayAvailable():
+        QMessageBox.critical(None, "System tray unavailable", "No system tray is available in this session.")
+        return 1
+
+    tray = BatteryTray(app)
+    app._thinkpad_battery_tray = tray
+    return app.exec()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

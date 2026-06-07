@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+BAT_PATH="${BAT_PATH:-/sys/class/power_supply/BAT0}"
+START_FILE="${BAT_PATH}/charge_control_start_threshold"
+STOP_FILE="${BAT_PATH}/charge_control_end_threshold"
+
+die() {
+  echo "ERROR: $*" >&2
+  exit 1
+}
+
+require_battery() {
+  [[ -d "$BAT_PATH" ]] || die "Battery path not found: $BAT_PATH"
+  [[ -w "$START_FILE" ]] || die "Start threshold file not writable: $START_FILE"
+  [[ -w "$STOP_FILE" ]] || die "Stop threshold file not writable: $STOP_FILE"
+}
+
+is_int() {
+  [[ "${1:-}" =~ ^[0-9]+$ ]]
+}
+
+validate_thresholds() {
+  local start="$1"
+  local stop="$2"
+
+  is_int "$start" || die "Start threshold is not a number: $start"
+  is_int "$stop" || die "Stop threshold is not a number: $stop"
+
+  (( start >= 0 && start <= 100 )) || die "Start threshold must be 0-100"
+  (( stop >= 0 && stop <= 100 )) || die "Stop threshold must be 0-100"
+  (( start <= stop )) || die "Start threshold must be less than or equal to stop threshold"
+}
+
+set_thresholds() {
+  local start="$1"
+  local stop="$2"
+
+  require_battery
+  validate_thresholds "$start" "$stop"
+
+  local current_start current_stop
+  current_start="$(cat "$START_FILE")"
+  current_stop="$(cat "$STOP_FILE")"
+
+  # The kernel rejects invalid intermediate states.
+  # If raising start above the current stop, raise stop first.
+  # If lowering stop below the current start, lower start first.
+  if (( start > current_stop )); then
+    echo "$stop" > "$STOP_FILE"
+    echo "$start" > "$START_FILE"
+  elif (( stop < current_start )); then
+    echo "$start" > "$START_FILE"
+    echo "$stop" > "$STOP_FILE"
+  else
+    echo "$start" > "$START_FILE"
+    echo "$stop" > "$STOP_FILE"
+  fi
+
+  echo "start=$(cat "$START_FILE")"
+  echo "stop=$(cat "$STOP_FILE")"
+}
+
+case "${1:-}" in
+  conserve)
+    set_thresholds 70 80
+    ;;
+  full)
+    set_thresholds 95 100
+    ;;
+  set)
+    set_thresholds "${2:-}" "${3:-}"
+    ;;
+  *)
+    die "Usage: $0 {conserve|full|set START STOP}"
+    ;;
+esac

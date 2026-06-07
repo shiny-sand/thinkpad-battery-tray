@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+pkexec /usr/local/libexec/thinkpad-battery-threshold-helper set 80 90
+
+echo "Balanced battery mode enabled: start 80%, stop 90%."
+battery-thresholds
